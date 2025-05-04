@@ -1,10 +1,12 @@
+import torch
 from torch import diag, stack, cat, nn, ones, linalg
 from torchvision.transforms import GaussianBlur
 import numpy as np
+from tltorch import TuckerTensor
 
 
 class DecompositionLayer(nn.Module):
-    def __init__(self, noise_percent=0.6, rank=70, steps=30, device='cpu'):
+    def __init__(self, noise_percent=0.6, decomposition='svd', rank=70, steps=30, device='cpu'):
         super().__init__()
         self.noise_percent = noise_percent
         self.rank = rank
@@ -13,16 +15,81 @@ class DecompositionLayer(nn.Module):
         # Formula is taken from https://www.mathworks.com/help/images/ref/imgaussfilt.html
         self.filter = GaussianBlur(kernel_size=5, sigma=0.7)
         self.steps = steps
+        if decomposition in ['svd', 'tucker']:
+            self.decomposition = decomposition
+        else:
+            raise NotImplementedError(f"only svd and tucker are supported, got {decomposition}")
 
     def forward(self, images):
+        if self.decomposition == 'svd':
+            return self.__svd_decomposition(images)
+        elif self.decomposition == 'tucker':
+            return self.__tucker_decomposition(images)
+
+    def __generate_patch_noise(self, img, patch_size=5):
+        # Create an array of ones
+        height = img.shape[-2]
+        width = img.shape[-1]
+
+        mask = np.ones((height, width))
+        mask_size = height * width
+        # Calculate how many elements we want to change to zero
+        num_zeros = int(mask_size * self.noise_percent)
+        elements_per_patch = patch_size * patch_size
+        num_patches_needed = (num_zeros + elements_per_patch - 1) // elements_per_patch
+        '''placed_patches = 0
+        print(num_patches_needed)
+        rng = np.random.default_rng()
+        while placed_patches < num_patches_needed:
+            row = rng.integers(0, height - patch_size + 1)
+            col = rng.integers(0, width - patch_size + 1)
+            patch_region = mask[row:row + patch_size, col:col + patch_size]
+            if np.all(patch_region == 1):
+                mask[row:row + patch_size, col:col + patch_size] = 0
+                placed_patches += 1'''
+        indices_to_change = np.random.choice(mask_size, num_patches_needed, replace=False)
+        # Change ones to zeros at those indices
+        for tl in zip(indices_to_change % (height-patch_size), indices_to_change // (height-patch_size)):
+            mask[tl[0]:tl[0] + patch_size, tl[1]:tl[1] + patch_size] = 0
+        mask = torch.Tensor(mask).to(self.device)
+        return (img * mask), mask
+
+    def __generate_salt_pepper_noise(self, img):
+        # Create an array of ones
+        height = img.shape[-2]
+        width = img.shape[-1]
+        channels = 1
+        if len(img) == 3:
+            channels = img.shape[-3]
+
+        if channels == 1:
+            mask = ones((height, width)).to(self.device)
+        elif channels == 3:
+            mask = ones((channels, height, width)).to(self.device)
+        else:
+            raise IndexError(f"Unsupported shape of mask: {channels}")
+        mask_size = height * width
+        # Calculate how many elements we want to change to zero
+        num_zeros = int(mask_size * self.noise_percent)
+        for channel in range(channels):
+            # Generate random indices where we want to change ones to zeros
+            indices_to_change = np.random.choice(mask_size, num_zeros, replace=False)
+            if channels == 1:
+                mask[indices_to_change % height, indices_to_change // height] = 0
+            else:
+                mask[channel, indices_to_change % height, indices_to_change // height] = 0
+        return (img * mask), mask
+
+    def __svd_decomposition(self, images):
         for ind, image in enumerate(images):
             I_flatten = cat([image[-3], image[-2], image[-1]], dim=1).to(self.device)
             B_Miss, mask = self.__generate_salt_pepper_noise(I_flatten)
             rev_mask = (mask - 1) * (-1)
-            X = B_Miss
+            X = B_Miss.clone()
             for _ in range(self.steps):
                 try:
-                    Y = self.__svd_decomposition(X.cpu())
+                    u, sig, vh = linalg.svd(X, full_matrices=False)
+                    Y = u[:, :self.rank] @ diag(sig[:self.rank]) @ vh[:self.rank, :]
                     X = B_Miss + rev_mask * Y
                     X = self.filter(X.unsqueeze(0)).squeeze(0).to(self.device)
                 except Exception as exc:
@@ -32,21 +99,20 @@ class DecompositionLayer(nn.Module):
                                  X[:, image.shape[-1] * 2:]])
         return images
 
-    def __generate_salt_pepper_noise(self, img):
-        # Create an array of ones
-        height = img.shape[-2]
-        width = img.shape[-1]
-
-        mask = ones((height, width)).to(self.device)
-        mask_size = height * width
-        # Calculate how many elements we want to change to zero
-        num_zeros = int(mask_size * self.noise_percent)
-        # Generate random indices where we want to change ones to zeros
-        indices_to_change = np.random.choice(mask_size, num_zeros, replace=False)
-        # Change ones to zeros at those indices
-        mask[indices_to_change % height, indices_to_change // height] = 0
-        return (img * mask), mask
-
-    def __svd_decomposition(self, X_):
-        u, sig, vh = linalg.svd(X_, full_matrices=False)
-        return u[:, :self.rank] @ diag(sig[:self.rank]) @ vh[:self.rank, :]
+    def __tucker_decomposition(self, images):
+        for ind, image in enumerate(images):
+            B_Miss, mask = self.__generate_salt_pepper_noise(image)
+            rev_mask = (mask - 1) * (-1)
+            X = B_Miss.clone()
+            for _ in range(self.steps):
+                try:
+                    with torch.no_grad():
+                        tt = TuckerTensor.from_tensor(X, rank=[3, self.rank, self.rank],
+                                                      n_iter_max=1, init='random')
+                        Y = tt.to_tensor().to(self.device)
+                    X = B_Miss + rev_mask * Y
+                    X = self.filter(X).to(self.device)
+                except Exception as exc:
+                    print(f"Exception in tucker_decomposition: {str(exc)}")
+            images[ind] = X
+        return images

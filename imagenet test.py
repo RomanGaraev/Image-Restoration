@@ -10,11 +10,14 @@ import numpy as np
 import torch
 
 
-def attack_test(attack, visualize=False):
+def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
     device = get_preferred_device()
-    dataset = ImageNetValidationDataset(root_dir='imagenet val (small)')
+    device = 'cpu'
+    print(f"Device: {device}")
+
+    dataset = ImageNetValidationDataset(root_dir='imagenet val (small)', model_id=model_id)
     dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=32,
+                                             batch_size=8,
                                              shuffle=True,
                                              num_workers=2,
                                              pin_memory=True)
@@ -26,8 +29,9 @@ def attack_test(attack, visualize=False):
     total_accuracy = defaultdict(np.ndarray)
     for noise_percent in [0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         # Model initialization
-        decompose = DecompositionLayer(noise_percent=noise_percent, device='cpu')
-        model = load_regular_model().to(device)
+        decompose = DecompositionLayer(noise_percent=noise_percent,
+                                       device=device, decomposition=method, rank=58, steps=30)
+        model = load_regular_model(model_id).to(device)
         attack.set_model(model)
         attack.set_device(device)
 
@@ -58,7 +62,10 @@ def attack_test(attack, visualize=False):
 
 
 if __name__ == '__main__':
-    atk = torchattacks.PGD(torch.nn.Module(), eps=8/255, alpha=2/255, random_start=False, steps=10)
-    accuracies, attack_descr = attack_test(atk, visualize=False)
-    print(f"Attack: {attack_descr}")
-    print(f"Accuracies: {accuracies}")
+    atk = torchattacks.AutoAttack(torch.nn.Module(), eps=4/255, version="plus", n_classes=1000)
+    model_ids = ["resnet50"]
+    for model in model_ids:
+        print(model)
+        accuracies, attack_descr = attack_test(atk, model, visualize=False, method='tucker')
+        with open("logs.txt", 'w') as f:
+            print(f"Attack: {attack_descr}.\n Accuracies: {accuracies}", file=f)

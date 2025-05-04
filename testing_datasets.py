@@ -1,3 +1,4 @@
+from torchvision.models import ResNet50_Weights, ResNet101_Weights, GoogLeNet_Weights, AlexNet_Weights
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
@@ -6,7 +7,7 @@ import os
 
 
 class ImageNetValidationDataset(Dataset):
-    def __init__(self, root_dir='imagenet val'):
+    def __init__(self, root_dir='imagenet val', model_id="resnet50"):
         super(ImageNetValidationDataset, self).__init__()
 
         # Load labels from JSON
@@ -37,6 +38,22 @@ class ImageNetValidationDataset(Dataset):
         self._mean = [0.485, 0.456, 0.406]
         self._std = [0.229, 0.224, 0.225]
 
+        self.model_id = model_id
+        if model_id == "resnet50":
+            self.transforms = ResNet50_Weights.IMAGENET1K_V2.transforms()
+        elif model_id == "resnet101":
+            self.transforms = ResNet101_Weights.IMAGENET1K_V2.transforms()
+        elif model_id == "alexnet":
+            self.transforms = AlexNet_Weights.IMAGENET1K_V1.transforms()
+        elif model_id == "googlenet":
+            self.transforms = GoogLeNet_Weights.IMAGENET1K_V1.transforms()
+        else:
+            print(f"{model_id} is not defined. Use default transformations")
+            self.transforms = transforms.Compose([transforms.Resize((232, 232)),
+                                                  transforms.ToTensor(),
+                                                  transforms.Normalize(mean=self._mean,
+                                                                       std=self._std)])
+
     def __len__(self):
         return len(self.image_files)
 
@@ -44,19 +61,8 @@ class ImageNetValidationDataset(Dataset):
         img_path = self.image_files[idx]
         syn_id = os.path.basename(os.path.dirname(img_path))
         label = self.syn_to_class[syn_id]
-
-        # Load and transform image
         image = Image.open(img_path).convert('RGB')
-
-        # Apply standard ImageNet transformations
-        transform = transforms.Compose([
-            transforms.Resize((232, 232)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self._mean,
-                                 std=self._std)
-        ])
-
-        image = transform(image)
+        image = self.transforms(image)
         return image, label
 
     def inverse_transform(self, x):
