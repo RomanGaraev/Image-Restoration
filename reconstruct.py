@@ -1,12 +1,14 @@
-import torch
 from torch import diag, stack, cat, nn, ones, linalg
 from torchvision.transforms import GaussianBlur
 import numpy as np
+import torch
+import math
 from tltorch import TuckerTensor
+from rtkpsvd import rtkpsvd
 
 
 class DecompositionLayer(nn.Module):
-    def __init__(self, noise_percent=0.6, decomposition='svd', rank=70, steps=30, device='cpu'):
+    def __init__(self, noise_percent=0.6, decomposition='svd', rank=70, steps=30, device: torch.device=torch.device('cpu')):
         super().__init__()
         self.noise_percent = noise_percent
         self.rank = rank
@@ -15,17 +17,27 @@ class DecompositionLayer(nn.Module):
         # Formula is taken from https://www.mathworks.com/help/images/ref/imgaussfilt.html
         self.filter = GaussianBlur(kernel_size=5, sigma=0.7)
         self.steps = steps
-        if decomposition in ['svd', 'tucker']:
+        if decomposition in ['svd', 'tucker', 'rtkpsvd']:
             self.decomposition = decomposition
         else:
-            raise NotImplementedError(f"only svd and tucker are supported, got {decomposition}")
+            raise NotImplementedError(f"only svd, tucker and rtkpsvd are supported, got {decomposition}")
+        self._rtkpsvd = None
 
     def forward(self, images):
         if self.decomposition == 'svd':
             return self.__svd_decomposition(images)
         elif self.decomposition == 'tucker':
             return self.__tucker_decomposition(images)
+        elif self.decomposition == 'rtkpsvd':
+            return self.__rtkpsvd_decomposition(images)
 
+    def get_metadata(self):
+        return {
+            'noise_percent': self.noise_percent,
+            'rank': self.rank,
+            'steps': self.steps,
+            'decomposition': self.decomposition
+        }
     def __generate_patch_noise(self, img, patch_size=5):
         # Create an array of ones
         height = img.shape[-2]
@@ -116,3 +128,79 @@ class DecompositionLayer(nn.Module):
                     print(f"Exception in tucker_decomposition: {str(exc)}")
             images[ind] = X
         return images
+
+    def __rtkpsvd_decomposition(self, images):
+        for ind, image in enumerate(images):
+            B_Miss, mask = self.__generate_salt_pepper_noise(image)
+            rev_mask = (mask - 1) * (-1)
+            X = B_Miss.clone()
+            for _ in range(self.steps):
+                try:
+                    Y = self.__rtkpsvd_reconstruct(X)
+                    
+                    X = B_Miss + rev_mask * Y
+                    X = self.filter(X).to(self.device)
+                except Exception as exc:
+                    print(f"Exception in rtkpsvd_decomposition: {str(exc)}")
+                    break
+            images[ind] = X
+        return images
+
+    def __rtkpsvd_reconstruct(self, tensor):
+        n_vec = self.__build_rtkpsvd_n(tensor.shape)
+        if not n_vec:
+            print(f"RTKPSVD failure: n_vec is empty")
+            return tensor
+        try:
+            B, sigmas = rtkpsvd(tensor, n_vec, self.rank)
+        except Exception as exc:
+            print(f"RTKPSVD failure: {exc}")
+            return tensor
+        if sigmas is None or sigmas.numel() == 0 or not B:
+            return tensor
+        terms_available = len(B[0]) if B and B[0] else sigmas.numel()
+        target_terms = self.rank if self.rank is not None else sigmas.numel()
+        max_terms = min(sigmas.numel(), target_terms, terms_available)
+        approx = torch.zeros_like(tensor, dtype=torch.float32, device=tensor.device)
+        numfac = len(B)
+        for term_idx in range(max_terms):
+            factors = [B[factor_idx][term_idx] for factor_idx in reversed(range(numfac))]
+            kron_prod = self.__mkron(factors)
+            approx = approx + sigmas[term_idx] * kron_prod
+        return approx.type_as(tensor)
+
+    def __build_rtkpsvd_n(self, shape):
+        left_dims = []
+        right_dims = []
+        for dim in shape:
+            l_val, r_val = self.__closest_factors(dim)
+            left_dims.append(l_val)
+            right_dims.append(r_val)
+        return left_dims + right_dims
+
+    @staticmethod
+    def __closest_factors(value):
+        if value <= 0:
+            return 1, 1
+        root = int(math.sqrt(value))
+        for candidate in range(root, 0, -1):
+            if value % candidate == 0:
+                return candidate, value // candidate
+        return 1, value
+
+    def __mkron(self, tensors):
+        if not tensors:
+            raise ValueError("Need at least one tensor to form Kronecker product.")
+        result = tensors[0]
+        for tensor in tensors[1:]:
+            result = self.__tkron(result, tensor)
+        return result
+
+    @staticmethod
+    def __tkron(A, B):
+        if not isinstance(A, torch.Tensor):
+            A = torch.as_tensor(A)
+        if not isinstance(B, torch.Tensor):
+            B = torch.as_tensor(B)
+        B = B.to(device=A.device, dtype=A.dtype)
+        return torch.kron(A, B)

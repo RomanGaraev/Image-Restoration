@@ -30,7 +30,7 @@ def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
     for noise_percent in [0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         # Model initialization
         decompose = DecompositionLayer(noise_percent=noise_percent,
-                                       device=device, decomposition=method, rank=58, steps=30)
+                                       device=device, decomposition=method, rank=70, steps=30)
         model = load_regular_model(model_id).to(device)
         attack.set_model(model)
         attack.set_device(device)
@@ -62,10 +62,10 @@ def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
 
 
 if __name__ == '__main__':
-    atk = torchattacks.AutoAttack(torch.nn.Module(), eps=4/255, version="plus", n_classes=1000)
+    atk = torchattacks.FGSM(torch.nn.Module(), eps=0)
     model_ids = ["resnet50"]
     for model in model_ids:
         print(model)
-        accuracies, attack_descr = attack_test(atk, model, visualize=False, method='tucker')
+        accuracies, attack_descr = attack_test(atk, model, visualize=False, method='svd')
         with open("logs.txt", 'w') as f:
             print(f"Attack: {attack_descr}.\n Accuracies: {accuracies}", file=f)
