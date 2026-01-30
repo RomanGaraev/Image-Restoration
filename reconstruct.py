@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import math
 from tltorch import TuckerTensor
-from rtkpsvd import rtkpsvd
+from utils import rtkpsvd, fullKTD
 
 
 class DecompositionLayer(nn.Module):
@@ -20,8 +20,7 @@ class DecompositionLayer(nn.Module):
         if decomposition in ['svd', 'tucker', 'rtkpsvd']:
             self.decomposition = decomposition
         else:
-            raise NotImplementedError(f"only svd, tucker and rtkpsvd are supported, got {decomposition}")
-        self._rtkpsvd = None
+            raise NotImplementedError(f"only svd, tucker, rtkpsvd are supported, got {decomposition}")
 
     def forward(self, images):
         if self.decomposition == 'svd':
@@ -30,7 +29,7 @@ class DecompositionLayer(nn.Module):
             return self.__tucker_decomposition(images)
         elif self.decomposition == 'rtkpsvd':
             return self.__rtkpsvd_decomposition(images)
-
+ 
     def get_metadata(self):
         return {
             'noise_percent': self.noise_percent,
@@ -134,10 +133,23 @@ class DecompositionLayer(nn.Module):
             B_Miss, mask = self.__generate_salt_pepper_noise(image)
             rev_mask = (mask - 1) * (-1)
             X = B_Miss.clone()
+            n_vec = self.__build_rtkpsvd_n(X.shape)
+            if not n_vec:
+                print("RTKPSVD failure: n_vec is empty")
+                continue
             for _ in range(self.steps):
                 try:
-                    Y = self.__rtkpsvd_reconstruct(X)
-                    
+                    Aij, sigmas = rtkpsvd(X, n_vec, self.rank)
+                    if not Aij or not Aij[0]:
+                        break
+                    terms_available = len(Aij[0])
+                    if terms_available == 0:
+                        break
+                    if self.rank is None:
+                        rank_to_use = terms_available
+                    else:
+                        rank_to_use = min(self.rank, terms_available)
+                    Y = fullKTD(Aij, sigmas, R=rank_to_use)
                     X = B_Miss + rev_mask * Y
                     X = self.filter(X).to(self.device)
                 except Exception as exc:
@@ -146,61 +158,23 @@ class DecompositionLayer(nn.Module):
             images[ind] = X
         return images
 
-    def __rtkpsvd_reconstruct(self, tensor):
-        n_vec = self.__build_rtkpsvd_n(tensor.shape)
-        if not n_vec:
-            print(f"RTKPSVD failure: n_vec is empty")
-            return tensor
-        try:
-            B, sigmas = rtkpsvd(tensor, n_vec, self.rank)
-        except Exception as exc:
-            print(f"RTKPSVD failure: {exc}")
-            return tensor
-        if sigmas is None or sigmas.numel() == 0 or not B:
-            return tensor
-        terms_available = len(B[0]) if B and B[0] else sigmas.numel()
-        target_terms = self.rank if self.rank is not None else sigmas.numel()
-        max_terms = min(sigmas.numel(), target_terms, terms_available)
-        approx = torch.zeros_like(tensor, dtype=torch.float32, device=tensor.device)
-        numfac = len(B)
-        for term_idx in range(max_terms):
-            factors = [B[factor_idx][term_idx] for factor_idx in reversed(range(numfac))]
-            kron_prod = self.__mkron(factors)
-            approx = approx + sigmas[term_idx] * kron_prod
-        return approx.type_as(tensor)
-
-    def __build_rtkpsvd_n(self, shape):
-        left_dims = []
-        right_dims = []
-        for dim in shape:
-            l_val, r_val = self.__closest_factors(dim)
-            left_dims.append(l_val)
-            right_dims.append(r_val)
-        return left_dims + right_dims
-
     @staticmethod
-    def __closest_factors(value):
+    def __closest_factors(value: int):
         if value <= 0:
             return 1, 1
         root = int(math.sqrt(value))
         for candidate in range(root, 0, -1):
             if value % candidate == 0:
-                return candidate, value // candidate
-        return 1, value
+                lower = candidate
+                upper = value // candidate
+                return upper, lower
+        return value, 1
 
-    def __mkron(self, tensors):
-        if not tensors:
-            raise ValueError("Need at least one tensor to form Kronecker product.")
-        result = tensors[0]
-        for tensor in tensors[1:]:
-            result = self.__tkron(result, tensor)
-        return result
-
-    @staticmethod
-    def __tkron(A, B):
-        if not isinstance(A, torch.Tensor):
-            A = torch.as_tensor(A)
-        if not isinstance(B, torch.Tensor):
-            B = torch.as_tensor(B)
-        B = B.to(device=A.device, dtype=A.dtype)
-        return torch.kron(A, B)
+    def __build_rtkpsvd_n(self, shape):
+        left_dims = []
+        right_dims = []
+        for dim in shape:
+            left, right = self.__closest_factors(int(dim))
+            left_dims.append(left)
+            right_dims.append(right)
+        return left_dims + right_dims

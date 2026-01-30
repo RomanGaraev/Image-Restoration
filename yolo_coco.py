@@ -204,8 +204,8 @@ if __name__ == "__main__":
     decompose = DecompositionLayer(noise_percent=0.7,
                                    device=device,
                                    decomposition='rtkpsvd',
-                                   rank=50,
-                                   steps=30)
+                                   rank=70,
+                                   steps=60)
     
     meter = DetectionMetricTracker()
     meter_adv = DetectionMetricTracker()
@@ -238,9 +238,9 @@ if __name__ == "__main__":
         #print(f"Average L_inf norm: {linf_norm}; Average L_2 norm: {l2_norm}")
         if dataloader_iterator.n > test_len:
             break
-        f1_adv = meter_adv.compute()['map']
-        f1_restored = meter_restored.compute()['map']
-        f1_original = meter.compute()['map']
+        f1_adv = meter_adv.compute()['f1']
+        f1_restored = meter_restored.compute()['f1']
+        f1_original = meter.compute()['f1']
         postfix = f"Adv {f1_adv} | Restored {f1_restored} | Original {f1_original}"
         dataloader_iterator.set_postfix_str(postfix)
     print(f"Denoising metrics: {decompose.get_metadata()}")
