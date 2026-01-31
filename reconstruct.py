@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import math
 from tltorch import TuckerTensor
-from utils import rtkpsvd, fullKTD
+from utils import rtkpsvd, rtkpsvd_numpy, fullKTD
 
 
 class DecompositionLayer(nn.Module):
@@ -17,10 +17,10 @@ class DecompositionLayer(nn.Module):
         # Formula is taken from https://www.mathworks.com/help/images/ref/imgaussfilt.html
         self.filter = GaussianBlur(kernel_size=5, sigma=0.7)
         self.steps = steps
-        if decomposition in ['svd', 'tucker', 'rtkpsvd']:
+        if decomposition in ['svd', 'tucker', 'rtkpsvd', 'rtkpsvd_numpy']:
             self.decomposition = decomposition
         else:
-            raise NotImplementedError(f"only svd, tucker, rtkpsvd are supported, got {decomposition}")
+            raise NotImplementedError(f"only svd, tucker, rtkpsvd and rtkpsvd_numpy are supported, got {decomposition}")
 
     def forward(self, images):
         if self.decomposition == 'svd':
@@ -29,6 +29,8 @@ class DecompositionLayer(nn.Module):
             return self.__tucker_decomposition(images)
         elif self.decomposition == 'rtkpsvd':
             return self.__rtkpsvd_decomposition(images)
+        elif self.decomposition == 'rtkpsvd_numpy':
+            return self.__rtkpsvd_decomposition_numpy(images)
  
     def get_metadata(self):
         return {
@@ -154,6 +156,38 @@ class DecompositionLayer(nn.Module):
                     X = self.filter(X).to(self.device)
                 except Exception as exc:
                     print(f"Exception in rtkpsvd_decomposition: {str(exc)}")
+                    break
+            images[ind] = X
+        return images
+
+    def __rtkpsvd_decomposition_numpy(self, images):
+        for ind, image in enumerate(images):
+            B_Miss, mask = self.__generate_salt_pepper_noise(image)
+            rev_mask = (mask - 1) * (-1)
+            X = B_Miss.clone()
+            n_vec = self.__build_rtkpsvd_n(X.shape)
+            if not n_vec:
+                print("RTKPSVD NumPy failure: n_vec is empty")
+                continue
+            for _ in range(self.steps):
+                try:
+                    X_np = X.detach().cpu().numpy()
+                    Aij, sigmas = rtkpsvd_numpy(X_np, n_vec, self.rank)
+                    if not Aij or not Aij[0]:
+                        break
+                    terms_available = len(Aij[0])
+                    if terms_available == 0:
+                        break
+                    if self.rank is None:
+                        rank_to_use = terms_available
+                    else:
+                        rank_to_use = min(self.rank, terms_available)
+                    Y_np = fullKTD(Aij, sigmas, R=rank_to_use)
+                    Y = torch.from_numpy(Y_np).to(device=self.device, dtype=X.dtype)
+                    X = B_Miss + rev_mask * Y
+                    X = self.filter(X).to(self.device)
+                except Exception as exc:
+                    print(f"Exception in rtkpsvd_numpy_decomposition: {str(exc)}")
                     break
             images[ind] = X
         return images

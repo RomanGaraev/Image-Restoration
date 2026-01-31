@@ -203,9 +203,9 @@ if __name__ == "__main__":
                                                              image_size=640)
     decompose = DecompositionLayer(noise_percent=0.7,
                                    device=device,
-                                   decomposition='rtkpsvd',
+                                   decomposition='rtkpsvd_numpy',
                                    rank=70,
-                                   steps=60)
+                                   steps=30)
     
     meter = DetectionMetricTracker()
     meter_adv = DetectionMetricTracker()

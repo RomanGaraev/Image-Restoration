@@ -1,3 +1,7 @@
 .idea/
 .DS_Store
 *.JPEG
+*.jpg
+*.png
+__pycache*
+*.pt

@@ -1,0 +1,2 @@
+Attack: AutoAttack(model_name=ResNet, device=cpu, attack_mode=default, targeted=False, normalization_used=True, norm=Linf, eps=0.01568627450980392, version=plus, n_classes=1000, seed=None, verbose=False).
+ Accuracies: dict_items([(0.6, 66.28989361702128)])
