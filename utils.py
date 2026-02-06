@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Dict, List, Optional, Union, Sequence, Tuple
+from regex import B
 from skimage.metrics import peak_signal_noise_ratio
 from torchvision.ops import box_iou
 import matplotlib.pyplot as plt
@@ -399,7 +400,13 @@ def _svd_econ_torch(matrix: torch.Tensor):
     return U, svals, Vh.transpose(-2, -1)
 
 
-def _basicrSVDd_numpy(A: np.ndarray, k: int, p: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _basicrSVDd_numpy(
+    A: np.ndarray,
+    k: int,
+    p: int,
+    *,
+    B: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     # Randomized SVD (Halko et al.) used by the MATLAB code for sparse trees.
     A = np.asarray(A)
     m, n = A.shape
@@ -407,8 +414,11 @@ def _basicrSVDd_numpy(A: np.ndarray, k: int, p: int) -> Tuple[np.ndarray, np.nda
     if k <= 0:
         return np.empty((m, 0)), np.empty((0,)), np.empty((n, 0))
     s = 5
-    rng = np.random.default_rng()
-    B = rng.standard_normal((n, k + s))
+    if B is None:
+        rng = np.random.default_rng()
+        B = rng.standard_normal((n, k + s))
+    else:
+        B = np.asarray(B)
     C = A @ B
     Q, _ = np.linalg.qr(C, mode="reduced")
     for _ in range(int(p)):
@@ -423,7 +433,12 @@ def _basicrSVDd_numpy(A: np.ndarray, k: int, p: int) -> Tuple[np.ndarray, np.nda
     return U, svals, V
 
 
-def _basicrSVDd_torch(A: torch.Tensor, k: int, p: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _basicrSVDd_torch(
+    A: torch.Tensor,
+    k: int,
+    p: int,
+    B: torch.Tensor = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Torch variant of basicrSVDd.m for randomized SVD.
     A_t = A if torch.is_tensor(A) else torch.as_tensor(A)
     m, n = A_t.shape
@@ -432,7 +447,12 @@ def _basicrSVDd_torch(A: torch.Tensor, k: int, p: int) -> Tuple[torch.Tensor, to
         empty = torch.empty((m, 0), device=A_t.device, dtype=A_t.dtype)
         return empty, torch.empty((0,), device=A_t.device, dtype=A_t.dtype), torch.empty((n, 0), device=A_t.device, dtype=A_t.dtype)
     s = 5
-    B = torch.randn((n, k + s), device=A_t.device, dtype=A_t.dtype)
+    if B is None:
+        rng = np.random.default_rng()
+
+        B = rng.standard_normal((n, k + s))
+        B = torch.tensor(B,device=A_t.device, dtype=A_t.dtype)
+        #B = torch.randn((n, k + s), device=A_t.device, dtype=A_t.dtype)
     C = A_t @ B
     Q, _ = torch.linalg.qr(C, mode="reduced")
     for _ in range(int(p)):

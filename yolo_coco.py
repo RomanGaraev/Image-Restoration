@@ -136,6 +136,12 @@ def build_object_vanishing_loss(preds_perm: torch.Tensor) -> torch.Tensor:
     target_object_mask = torch.zeros_like(objectness_logits)
     return F.binary_cross_entropy_with_logits(objectness_logits, target_object_mask, reduction="sum")
 
+def build_object_fabrication_loss(preds_perm: torch.Tensor) -> torch.Tensor:
+    """Binary cross-entropy on objectness logits with the one mask used for fabrication attacks."""
+    objectness_logits = preds_perm[..., 4:5]
+    target_object_mask = torch.ones_like(objectness_logits)
+    return F.binary_cross_entropy_with_logits(objectness_logits, target_object_mask, reduction="sum")
+
 
 def compute_object_vanishing_gradient(model: YOLO, images: torch.Tensor) -> torch.Tensor:
     """Compute gradients that suppress objectness predictions similar to the Keras implementation."""
@@ -151,6 +157,88 @@ def compute_object_vanishing_gradient(model: YOLO, images: torch.Tensor) -> torc
         preds = preds[0]
     preds_perm = preds.permute(0, 2, 1).contiguous()
     loss = build_object_vanishing_loss(preds_perm)
+
+    detector.zero_grad(set_to_none=True)
+    if inputs.grad is not None:
+        inputs.grad.zero_()
+    loss.backward()
+    grad = inputs.grad.detach().clone()
+
+    if was_training:
+        detector.train()
+    detector.zero_grad(set_to_none=True)
+    return grad
+
+
+def compute_object_fabrication_gradient(model: YOLO, images: torch.Tensor) -> torch.Tensor:
+    """Compute gradients that amplify objectness predictions for fabrication attacks."""
+    device = getattr(model, "device", images.device)
+    detector = model.model
+    was_training = detector.training
+    detector.eval()
+
+    inputs = images.detach().clone().to(device)
+    inputs.requires_grad_(True)
+    preds = detector(inputs)
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    preds_perm = preds.permute(0, 2, 1).contiguous()
+    loss = build_object_fabrication_loss(preds_perm)
+
+    detector.zero_grad(set_to_none=True)
+    if inputs.grad is not None:
+        inputs.grad.zero_()
+    loss.backward()
+    grad = inputs.grad.detach().clone()
+
+    if was_training:
+        detector.train()
+    detector.zero_grad(set_to_none=True)
+    return grad
+
+
+def compute_object_mislabeling_gradient(model: YOLO,
+                                        images: torch.Tensor,
+                                        target: str = "ml",
+                                        conf_threshold: float = 0.25) -> torch.Tensor:
+    """Compute gradients that push class logits toward a wrong label (ML/LL)."""
+    if target.lower() not in {"ml", "ll"}:
+        raise ValueError("target must be 'ml' (most-likely) or 'll' (least-likely).")
+    device = getattr(model, "device", images.device)
+    detector = model.model
+    was_training = detector.training
+    detector.eval()
+
+    inputs = images.detach().clone().to(device)
+    inputs.requires_grad_(True)
+    preds = detector(inputs)
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    preds_perm = preds.permute(0, 2, 1).contiguous()
+    if preds_perm.shape[-1] <= 5:
+        raise ValueError("Predictions do not contain class logits for mislabeling.")
+
+    objectness_logits = preds_perm[..., 4]
+    class_logits = preds_perm[..., 5:]
+    class_probs = torch.softmax(class_logits, dim=-1)
+
+    if target.lower() == "ll":
+        target_class = torch.argmin(class_logits, dim=-1)
+    else:
+        masked_logits = class_logits.clone()
+        masked_logits[class_probs > conf_threshold] = float("-inf")
+        target_class = torch.argmax(masked_logits, dim=-1)
+        fallback = torch.isinf(masked_logits).all(dim=-1)
+        if fallback.any():
+            target_class = torch.where(fallback, torch.argmin(class_logits, dim=-1), target_class)
+
+    mask = objectness_logits.sigmoid() > conf_threshold
+    if mask.any():
+        logits_sel = class_logits[mask]
+        target_sel = target_class[mask]
+        loss = F.cross_entropy(logits_sel, target_sel, reduction="sum")
+    else:
+        loss = class_logits.sum() * 0.0
 
     detector.zero_grad(set_to_none=True)
     if inputs.grad is not None:
@@ -194,6 +282,30 @@ def tog_vanishing(model: YOLO, x_query, targets, n_iter=10, eps=8/255., eps_iter
     return x_adv.detach()
 
 
+def tog_fabrication(model: YOLO, x_query, targets, n_iter=10, eps=8/255., eps_iter=8/255.):
+    eta = np.random.uniform(-eps, eps, size=x_query.shape).astype(np.float32)
+    eta = torch.tensor(eta, device=x_query.device)
+    x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    for _ in range(n_iter):
+        grad = compute_object_fabrication_gradient(model, x_adv)
+        x_adv = torch.clamp(x_adv + eps_iter * grad.sign(), 0.0, 1.0)
+        eta = torch.clamp(x_adv - x_query, -eps, eps)
+        x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    return x_adv.detach()
+
+
+def tog_mislabeling(model: YOLO, x_query, targets, target="ml", n_iter=10, eps=8/255., eps_iter=8/255.):
+    eta = np.random.uniform(-eps, eps, size=x_query.shape).astype(np.float32)
+    eta = torch.tensor(eta, device=x_query.device)
+    x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    for _ in range(n_iter):
+        grad = compute_object_mislabeling_gradient(model, x_adv, target=target)
+        x_adv = torch.clamp(x_adv + eps_iter * grad.sign(), 0.0, 1.0)
+        eta = torch.clamp(x_adv - x_query, -eps, eps)
+        x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    return x_adv.detach()
+
+
 if __name__ == "__main__":
     images_dir, annotations_file = prepare_coco_resources()
     model, device, dataset, dataloader = load_model_and_data(model_path="models/yolo11m.pt",
@@ -203,7 +315,7 @@ if __name__ == "__main__":
                                                              image_size=640)
     decompose = DecompositionLayer(noise_percent=0.7,
                                    device=device,
-                                   decomposition='rtkpsvd_numpy',
+                                   decomposition='tucker',
                                    rank=70,
                                    steps=30)
     
@@ -228,9 +340,9 @@ if __name__ == "__main__":
         meter_adv.update(predictions_adv, targets)
         meter_restored.update(predictions_restored, targets)
 
-        visualize_detections(images, predictions, targets, "Original", batch_index, class_names=model.names)
-        visualize_detections(adv_pred, predictions_adv, targets, "Adversarial", batch_index, class_names=model.names)
-        visualize_detections(restored, predictions_restored, targets, "Restored", batch_index, class_names=model.names)
+        #visualize_detections(images, predictions, targets, "Original", batch_index, class_names=model.names)
+        #visualize_detections(adv_pred, predictions_adv, targets, "Adversarial", batch_index, class_names=model.names)
+        #visualize_detections(restored, predictions_restored, targets, "Restored", batch_index, class_names=model.names)
         batch_index += 1
         #diff = (adv_pred.to('cpu') - images.to('cpu')).view(images.size(0), -1)
         #linf_norm = max(abs(diff).max(dim=1)[0])
@@ -242,8 +354,9 @@ if __name__ == "__main__":
         f1_restored = meter_restored.compute()['f1']
         f1_original = meter.compute()['f1']
         postfix = f"Adv {f1_adv} | Restored {f1_restored} | Original {f1_original}"
+        
         dataloader_iterator.set_postfix_str(postfix)
-    print(f"Denoising metrics: {decompose.get_metadata()}")
+        #print(f"Denoising metrics: {decompose.get_metadata()}")
     print(f"Original images metrics: {meter.compute()}")
-    print(f"Adversarial images metrics: {meter_adv.compute()}")
+    #print(f"Adversarial images metrics: {meter_adv.compute()}")
     print(f"Restored images metrics: {meter_restored.compute()}")
