@@ -2,6 +2,7 @@ from torchvision.models import ResNet50_Weights, ResNet101_Weights, GoogLeNet_We
 from typing import Callable, Dict, Iterable, List, Optional
 from pycocotools.coco import COCO
 from torch.utils.data import Dataset
+from torchvision.datasets import CIFAR10
 from torchvision.ops import box_iou
 from torchvision import transforms
 from PIL import Image
@@ -80,6 +81,62 @@ class ImageNetValidationDataset(Dataset):
 
     def label(self, ind):
         return self.imagenet_labels[ind].split(",")[0].replace("'", "")
+
+    @property
+    def mean(self):
+        return self._mean
+
+    @property
+    def std(self):
+        return self._std
+
+
+class CIFAR10Dataset(Dataset):
+    def __init__(self, root_dir='data/cifar10', model_id="resnet50", train=False, download=True):
+        super(CIFAR10Dataset, self).__init__()
+        self.root_dir = root_dir
+        self.train = train
+
+        # Keep normalization compatible with ImageNet-pretrained classifiers by default.
+        self._mean = [0.485, 0.456, 0.406]
+        self._std = [0.229, 0.224, 0.225]
+
+        if model_id == "resnet50":
+            self.transforms = ResNet50_Weights.IMAGENET1K_V2.transforms()
+        elif model_id == "resnet101":
+            self.transforms = ResNet101_Weights.IMAGENET1K_V2.transforms()
+        elif model_id == "alexnet":
+            self.transforms = AlexNet_Weights.IMAGENET1K_V1.transforms()
+        elif model_id == "googlenet":
+            self.transforms = GoogLeNet_Weights.IMAGENET1K_V1.transforms()
+        else:
+            self.transforms = transforms.Compose([transforms.Resize((224, 224)),
+                                                  transforms.ToTensor(),
+                                                  transforms.Normalize(mean=self._mean,
+                                                                       std=self._std)])
+
+        self.dataset = CIFAR10(root=self.root_dir,
+                               train=self.train,
+                               transform=self.transforms,
+                               download=download)
+        self.class_names = self.dataset.classes
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+    def inverse_transform(self, x):
+        invTrans = transforms.Compose([transforms.Normalize(mean=[0., 0., 0.],
+                                                            std=[1 / i for i in self._std]),
+                                       transforms.Normalize(mean=[-i for i in self._mean],
+                                                            std=[1., 1., 1.]),
+                                       ])
+        return invTrans(x)
+
+    def label(self, ind):
+        return self.class_names[ind]
 
     @property
     def mean(self):

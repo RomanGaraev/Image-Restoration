@@ -5,3 +5,5 @@
 *.png
 __pycache*
 *.pt
+data/cifar10/*
+.vscode

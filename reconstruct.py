@@ -15,7 +15,8 @@ class DecompositionLayer(nn.Module):
         self.device = device
         # kernel_size with respect to sigma: 2*ceil(sigma * 2) + 1.
         # Formula is taken from https://www.mathworks.com/help/images/ref/imgaussfilt.html
-        self.filter = GaussianBlur(kernel_size=5, sigma=0.7)
+        # CIFAR 3 0.3
+        self.filter = GaussianBlur(kernel_size=5, sigma=2)
         self.steps = steps
         if decomposition in ['svd', 'tucker', 'rtkpsvd', 'rtkpsvd_numpy']:
             self.decomposition = decomposition

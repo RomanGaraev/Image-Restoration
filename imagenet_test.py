@@ -1,6 +1,6 @@
-from testing_datasets import ImageNetValidationDataset
+from testing_datasets import ImageNetValidationDataset, CIFAR10Dataset
 from utils import calculate_accuracy, compare_images, get_preferred_device
-from models import load_regular_model, load_AT_model, load_robust_model
+from models import load_regular_model_imagenet, load_regular_model_cifar, load_AT_model, load_robust_model
 from reconstruct import DecompositionLayer
 
 from collections import defaultdict
@@ -10,14 +10,27 @@ import numpy as np
 import torch
 
 
-def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
+def attack_test(attack,
+                model_id="resnet50",
+                visualize=False,
+                method='svd',
+                dataset_name="imagenet"):
     device = get_preferred_device()
     device = 'cpu'
     print(f"Device: {device}")
 
-    dataset = ImageNetValidationDataset(root_dir='imagenet val (small)', model_id=model_id)
+    dataset_name = dataset_name.lower()
+    if dataset_name == "imagenet":
+        dataset = ImageNetValidationDataset(root_dir='data/imagenet val (small)', model_id=model_id)
+        model_loader = load_regular_model_imagenet
+    elif dataset_name == "cifar10":
+        dataset = CIFAR10Dataset(root_dir='data/cifar10', model_id=model_id, train=False, download=True)
+        model_loader = load_regular_model_cifar
+    else:
+        raise ValueError(f"Unsupported dataset_name '{dataset_name}'. Use 'imagenet' or 'cifar10'.")
+
     dataloader = torch.utils.data.DataLoader(dataset,
-                                             batch_size=8,
+                                             batch_size=4,
                                              shuffle=True,
                                              num_workers=2,
                                              pin_memory=True)
@@ -27,11 +40,11 @@ def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
     attack.set_mode_default()
 
     total_accuracy = defaultdict(np.ndarray)
-    for noise_percent in [0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    for noise_percent in [0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         # Model initialization
         decompose = DecompositionLayer(noise_percent=noise_percent,
-                                       device=device, decomposition=method, rank=70, steps=30)
-        model = load_regular_model(model_id).to(device)
+                                       device=device, decomposition=method, rank=7, steps=30)
+        model = model_loader(model_id).to(device)
         attack.set_model(model)
         attack.set_device(device)
 
@@ -50,7 +63,7 @@ def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
                                dataset.inverse_transform(adv_samples[0].cpu().detach()).numpy(),
                                dataset.inverse_transform(restored_imgs[0].cpu().detach()).numpy(),
                                clean_pred, adv_pred, restored_pred)
-
+            #  
             outputs = model(restored_imgs)
             _, predicted = torch.max(outputs.data, 1)
             accuracy = calculate_accuracy(labels, predicted)
@@ -62,10 +75,17 @@ def attack_test(attack, model_id="resnet50", visualize=False, method='svd'):
 
 
 if __name__ == '__main__':
-    atk = torchattacks.FGSM(torch.nn.Module(), eps=0)
+    dataset_name = "cifar10"
+    n_classes = 1000 if dataset_name == "imagenet" else 10
+    #atk = torchattacks.AutoAttack(torch.nn.Module(), eps=8/255, norm='Linf', n_classes=n_classes, version="plus")
+    atk = torchattacks.PGD(torch.nn.Module(), eps=8/255 )
     model_ids = ["resnet50"]
     for model in model_ids:
         print(model)
-        accuracies, attack_descr = attack_test(atk, model, visualize=False, method='svd')
+        accuracies, attack_descr = attack_test(atk,
+                                               model,
+                                               visualize=False,
+                                               method='svd',
+                                               dataset_name=dataset_name)
         with open("logs.txt", 'w') as f:
             print(f"Attack: {attack_descr}.\n Accuracies: {accuracies}", file=f)
