@@ -1,5 +1,6 @@
 from torch import diag, stack, cat, nn, ones, linalg
 from torchvision.transforms import GaussianBlur
+from torchvision.transforms.functional import adjust_sharpness
 import numpy as np
 import torch
 import math
@@ -8,7 +9,8 @@ from utils import rtkpsvd, rtkpsvd_numpy, fullKTD
 
 
 class DecompositionLayer(nn.Module):
-    def __init__(self, noise_percent=0.6, decomposition='svd', rank=70, steps=30, device: torch.device=torch.device('cpu')):
+    def __init__(self, noise_percent=0.6, decomposition='svd', rank=70, steps=30,
+                 device: torch.device=torch.device('cpu'), sharpening_factor=1.5):
         super().__init__()
         self.noise_percent = noise_percent
         self.rank = rank
@@ -18,6 +20,9 @@ class DecompositionLayer(nn.Module):
         # CIFAR 3 0.3
         self.filter = GaussianBlur(kernel_size=5, sigma=2)
         self.steps = steps
+        if sharpening_factor < 0:
+            raise ValueError(f"sharpening_factor must be non-negative, got {sharpening_factor}")
+        self.sharpening_factor = float(sharpening_factor)
         if decomposition in ['svd', 'tucker', 'rtkpsvd', 'rtkpsvd_numpy']:
             self.decomposition = decomposition
         else:
@@ -38,8 +43,21 @@ class DecompositionLayer(nn.Module):
             'noise_percent': self.noise_percent,
             'rank': self.rank,
             'steps': self.steps,
+            'sharpening_factor': self.sharpening_factor,
             'decomposition': self.decomposition
         }
+
+    def __sharpen(self, image):
+        """Apply a single deterministic unsharp-mask pass after reconstruction.
+
+        ``adjust_sharpness`` supports both normalized and pixel-space tensors,
+        so no clipping is done here. A factor of 1.0 disables sharpening.
+        """
+        if self.sharpening_factor == 1.0:
+            return image
+        print(f"Applying sharpening with factor {self.sharpening_factor}")
+        return adjust_sharpness(image, self.sharpening_factor)
+
     def __generate_patch_noise(self, img, patch_size=5):
         # Create an array of ones
         height = img.shape[-2]
@@ -108,9 +126,10 @@ class DecompositionLayer(nn.Module):
                     X = self.filter(X.unsqueeze(0)).squeeze(0).to(self.device)
                 except Exception as exc:
                     print(f"Exception in svd_decomposition: {str(exc)}")
-            images[ind] = stack([X[:, :image.shape[-1]],
-                                 X[:, image.shape[-1]:image.shape[-1] * 2],
-                                 X[:, image.shape[-1] * 2:]])
+            reconstructed = stack([X[:, :image.shape[-1]],
+                                   X[:, image.shape[-1]:image.shape[-1] * 2],
+                                   X[:, image.shape[-1] * 2:]])
+            images[ind] = self.__sharpen(reconstructed)
         return images
 
     def __tucker_decomposition(self, images):
@@ -128,7 +147,7 @@ class DecompositionLayer(nn.Module):
                     X = self.filter(X).to(self.device)
                 except Exception as exc:
                     print(f"Exception in tucker_decomposition: {str(exc)}")
-            images[ind] = X
+            images[ind] = self.__sharpen(X)
         return images
 
     def __rtkpsvd_decomposition(self, images):
@@ -158,7 +177,7 @@ class DecompositionLayer(nn.Module):
                 except Exception as exc:
                     print(f"Exception in rtkpsvd_decomposition: {str(exc)}")
                     break
-            images[ind] = X
+            images[ind] = self.__sharpen(X)
         return images
 
     def __rtkpsvd_decomposition_numpy(self, images):
@@ -190,7 +209,7 @@ class DecompositionLayer(nn.Module):
                 except Exception as exc:
                     print(f"Exception in rtkpsvd_numpy_decomposition: {str(exc)}")
                     break
-            images[ind] = X
+            images[ind] = self.__sharpen(X)
         return images
 
     @staticmethod
