@@ -15,8 +15,8 @@ from load_yolo_coco import (
 )
 from reconstruct import DecompositionLayer
 from rfdetr import RFDETRLarge
-from rfdetr.util.coco_classes import COCO_CLASSES
-from rfdetr.util.misc import NestedTensor
+from rfdetr.assets.coco_classes import COCO_CLASSES
+from rfdetr.utilities import NestedTensor
 from utils import DetectionMetricTracker
 
 
@@ -53,13 +53,57 @@ def _predict_batch_rfdetr(
 
 
 def _get_rfdetr_device(model: RFDETRLarge) -> torch.device:
+    """Return the device that actually holds the detector weights."""
+    core_model = model.model.model
+    parameter = next(core_model.parameters(), None)
+    if parameter is not None:
+        return parameter.device
+
+    buffer = next(core_model.buffers(), None)
+    if buffer is not None:
+        return buffer.device
+
     device = getattr(model.model, "device", torch.device("cpu"))
-    if isinstance(device, torch.device):
-        return device
-    return torch.device(device)
+    return device if isinstance(device, torch.device) else torch.device(device)
 
 
-def _rfdetr_logits(model: RFDETRLarge, images: torch.Tensor) -> torch.Tensor:
+def _move_rfdetr_model_to_device(model: RFDETRLarge, device: str | torch.device) -> torch.device:
+    """Move RF-DETR's lazily placed PyTorch module before direct forward calls."""
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but PyTorch cannot access a CUDA device.")
+
+    model.model.model.to(target_device)
+    # Keep RF-DETR's context in sync for its public predict() method.
+    model.model.device = target_device
+    return _get_rfdetr_device(model)
+
+
+def _get_rfdetr_resolution(model: RFDETRLarge) -> int | tuple[int, int] | None:
+    """Read the resolution used by RF-DETR's public prediction context.
+
+    RF-DETR stores this on ``model.model`` (its ModelContext), not on the
+    public RFDETRLarge wrapper. Using that same value keeps the differentiable
+    attack forward pass aligned with ``model.predict`` used for metrics.
+    """
+    model_context = getattr(model, "model", None)
+    model_config = getattr(model, "model_config", None)
+    for resolution in (
+        getattr(model_context, "resolution", None),
+        getattr(model_config, "resolution", None),
+        # Compatibility fallbacks for older RF-DETR versions/wrappers.
+        getattr(model, "resolution", None),
+        getattr(model, "imgsz", None),
+        getattr(model, "image_size", None),
+    ):
+        if isinstance(resolution, int) and not isinstance(resolution, bool):
+            return resolution
+        if isinstance(resolution, (tuple, list)) and len(resolution) == 2:
+            return int(resolution[0]), int(resolution[1])
+    return None
+
+
+def _rfdetr_outputs(model: RFDETRLarge, images: torch.Tensor) -> Dict[str, torch.Tensor]:
     device = _get_rfdetr_device(model)
     means_value = getattr(model, "means", [0.485, 0.456, 0.406])
     stds_value = getattr(model, "stds", [0.229, 0.224, 0.225])
@@ -67,11 +111,7 @@ def _rfdetr_logits(model: RFDETRLarge, images: torch.Tensor) -> torch.Tensor:
     stds = torch.as_tensor(stds_value, device=device, dtype=images.dtype).view(1, 3, 1, 1)
     normalized = (images.to(device) - means) / stds
 
-    resolution = getattr(model, "resolution", None)
-    if resolution is None:
-        resolution = getattr(model, "imgsz", None)
-    if resolution is None:
-        resolution = getattr(model, "image_size", None)
+    resolution = _get_rfdetr_resolution(model)
 
     if isinstance(resolution, int):
         target_size = (resolution, resolution)
@@ -90,78 +130,137 @@ def _rfdetr_logits(model: RFDETRLarge, images: torch.Tensor) -> torch.Tensor:
     else:
         resized = normalized
 
-    def _extract_pred_logits(outputs_obj) -> torch.Tensor:
+    def _extract_outputs(outputs_obj) -> Dict[str, torch.Tensor]:
         outputs_norm = outputs_obj
         if isinstance(outputs_norm, tuple):
             outputs_norm = outputs_norm[-1]
-        if isinstance(outputs_norm, dict):
-            if "pred_logits" in outputs_norm:
-                return outputs_norm["pred_logits"]
-            if "logits" in outputs_norm:
-                return outputs_norm["logits"]
-        raise RuntimeError("RF-DETR outputs do not contain logits compatible with attacks.")
+        if not isinstance(outputs_norm, dict) or "pred_logits" not in outputs_norm:
+            raise RuntimeError("RF-DETR outputs do not contain logits compatible with attacks.")
+        return outputs_norm
 
     core_model = model.model.model
     batch_size, _, height, width = resized.shape
     mask = torch.zeros((batch_size, height, width), dtype=torch.bool, device=resized.device)
     samples = NestedTensor(resized, mask)
     try:
-        return _extract_pred_logits(core_model(samples))
+        return _extract_outputs(core_model(samples))
     except (TypeError, AttributeError):
         # Compatibility fallback for versions that only accept tensor input.
-        return _extract_pred_logits(core_model(resized))
+        return _extract_outputs(core_model(resized))
 
+
+@torch.no_grad()
+def _vanishing_diagnostics(model: RFDETRLarge, images: torch.Tensor) -> Dict[str, float]:
+    """Measure the exact objective that the RF-DETR vanishing attack minimizes."""
+    model_core = model.model.model
+    was_training = model_core.training
+    model_core.eval()
+    try:
+        logits = _rfdetr_outputs(model, images)["pred_logits"]
+        probabilities = logits.sigmoid()
+        return {
+            "zero_target_bce": float(
+                F.binary_cross_entropy_with_logits(logits, torch.zeros_like(logits), reduction="mean").item()
+            ),
+            "mean_max_class_probability": float(probabilities.amax(dim=-1).mean().item()),
+        }
+    finally:
+        if was_training:
+            model_core.train()
 
 def _build_rfdetr_attack_loss(
     pred_logits: torch.Tensor,
+    pred_boxes: torch.Tensor,
     attack_name: str,
-    conf_threshold: float = 0.25,
+    attack_targets: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    if pred_logits.shape[-1] <= 1:
-        raise RuntimeError("RF-DETR logits do not contain foreground classes.")
-
-    foreground_logits = pred_logits[..., :-1]
-    no_object_logits = pred_logits[..., -1]
-    foreground_scores = foreground_logits.max(dim=-1).values
-
-    if attack_name in {"untargeted_fgsm", "untargeted_multistep_fgsm"}:
-        # Push predictions toward the no-object token and away from foreground classes.
-        return (no_object_logits - foreground_scores).mean()
-
     if attack_name == "vanishing":
-        # Stronger suppression of foreground confidence.
-        return (no_object_logits - foreground_logits.logsumexp(dim=-1)).mean()
+        # RF-DETR uses a sigmoid class head with no background/no-object logit.
+        # Driving every class logit toward zero is its equivalent of assigning
+        # all anchor objectness targets to background in the original TOG code.
+        return F.binary_cross_entropy_with_logits(
+            pred_logits,
+            torch.zeros_like(pred_logits),
+            reduction="sum",
+        )
 
     if attack_name == "fabrication":
-        # Increase foreground confidence and suppress no-object confidence.
-        return (foreground_logits.logsumexp(dim=-1) - no_object_logits).mean()
+        # A query's maximum class logit is the RF-DETR counterpart to an
+        # objectness logit. Targeting it to one fabricates high-confidence
+        # detections without imposing a particular class.
+        objectness_surrogate = pred_logits.amax(dim=-1)
+        return F.binary_cross_entropy_with_logits(
+            objectness_surrogate,
+            torch.ones_like(objectness_surrogate),
+            reduction="sum",
+        )
+
+    query_mask = attack_targets["query_mask"]
+    if not query_mask.any():
+        return pred_logits.sum() * 0.0
+
+    target_labels = attack_targets["labels"]
+    target_boxes = attack_targets["boxes"]
+    classification_loss = F.cross_entropy(
+        pred_logits[query_mask], target_labels[query_mask], reduction="sum"
+    )
+    localization_loss = F.l1_loss(
+        pred_boxes[query_mask], target_boxes[query_mask], reduction="sum"
+    )
+
+    if attack_name in {"untargeted_fgsm", "untargeted_multistep_fgsm"}:
+        # TOG-untargeted minimizes the negative clean-detection loss, thereby
+        # increasing the loss of the clean query labels and boxes.
+        return -(classification_loss + localization_loss)
 
     if attack_name in {"mislabeling_ml", "mislabeling_ll"}:
-        probs = torch.softmax(foreground_logits, dim=-1)
-        conf = probs.max(dim=-1).values
-        active = conf > conf_threshold
-        if not active.any():
-            return pred_logits.sum() * 0.0
-
-        logits_active = foreground_logits[active]
-        if attack_name == "mislabeling_ll":
-            target_class = logits_active.argmin(dim=-1)
-        else:
-            if logits_active.shape[-1] == 1:
-                target_class = torch.zeros(logits_active.shape[0], dtype=torch.long, device=logits_active.device)
-            else:
-                top2 = torch.topk(logits_active, k=2, dim=-1).indices
-                target_class = top2[:, 1]
-        # Minimize CE toward wrong classes via gradient ascent on negative CE.
-        return -F.cross_entropy(logits_active, target_class, reduction="mean")
+        # The target labels/boxes are frozen from the clean image, as in TOG.
+        return classification_loss + localization_loss
 
     raise ValueError(f"Unsupported attack '{attack_name}'")
+
+
+def _build_rfdetr_attack_targets(
+    model: RFDETRLarge,
+    images: torch.Tensor,
+    attack_name: str,
+    conf_threshold: float,
+) -> Dict[str, torch.Tensor]:
+    """Freeze clean-image query targets before the TOG optimization loop."""
+    model_core = model.model.model
+    was_training = model_core.training
+    model_core.eval()
+    with torch.no_grad():
+        clean_outputs = _rfdetr_outputs(model, images)
+    if was_training:
+        model_core.train()
+
+    clean_logits = clean_outputs["pred_logits"].detach()
+    clean_boxes = clean_outputs["pred_boxes"].detach()
+    query_mask = clean_logits.sigmoid().amax(dim=-1) > conf_threshold
+    labels = clean_logits.argmax(dim=-1)
+
+    if attack_name == "mislabeling_ll":
+        labels = clean_logits.argmin(dim=-1)
+    elif attack_name == "mislabeling_ml":
+        class_probs = torch.softmax(clean_logits, dim=-1)
+        masked_logits = clean_logits.masked_fill(class_probs > conf_threshold, float("-inf"))
+        labels = masked_logits.argmax(dim=-1)
+        fallback = torch.isinf(masked_logits).all(dim=-1)
+        labels = torch.where(fallback, clean_logits.argmin(dim=-1), labels)
+
+    return {
+        "query_mask": query_mask,
+        "labels": labels.detach(),
+        "boxes": clean_boxes,
+    }
 
 
 def _compute_rfdetr_gradient(
     model: RFDETRLarge,
     images: torch.Tensor,
     attack_name: str,
+    attack_targets: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
     model_core = model.model.model
     was_training = model_core.training
@@ -169,8 +268,13 @@ def _compute_rfdetr_gradient(
 
     inputs = images.detach().clone().to(_get_rfdetr_device(model))
     inputs.requires_grad_(True)
-    pred_logits = _rfdetr_logits(model, inputs)
-    loss = _build_rfdetr_attack_loss(pred_logits, attack_name)
+    outputs = _rfdetr_outputs(model, inputs)
+    loss = _build_rfdetr_attack_loss(
+        outputs["pred_logits"],
+        outputs["pred_boxes"],
+        attack_name,
+        attack_targets,
+    )
 
     model_core.zero_grad(set_to_none=True)
     if inputs.grad is not None:
@@ -191,20 +295,25 @@ def _run_rfdetr_attack(
     eps: float,
     eps_iter: float,
     n_iter: int,
+    conf_threshold: float,
 ) -> torch.Tensor:
     x_query = images.detach().clone().to(_get_rfdetr_device(model))
+    original = x_query.detach()
+    iterations = 1 if attack_name == "untargeted_fgsm" else n_iter
+    attack_targets = _build_rfdetr_attack_targets(
+        model, original, attack_name, conf_threshold
+    )
 
-    if attack_name == "untargeted_fgsm":
-        grad = _compute_rfdetr_gradient(model, x_query, attack_name)
-        return torch.clamp(x_query + eps * grad.sign(), 0.0, 1.0).detach()
-
-    eta = torch.empty_like(x_query).uniform_(-eps, eps)
-    x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
-    for _ in range(n_iter):
-        grad = _compute_rfdetr_gradient(model, x_adv, attack_name)
-        x_adv = torch.clamp(x_adv + eps_iter * grad.sign(), 0.0, 1.0)
-        eta = torch.clamp(x_adv - x_query, -eps, eps)
-        x_adv = torch.clamp(x_query + eta, 0.0, 1.0)
+    # Use the same random-start projected L-infinity procedure as yolo_coco.py.
+    eta = torch.empty_like(original).uniform_(-eps, eps)
+    x_adv = torch.clamp(original + eta, 0.0, 1.0)
+    for _ in range(iterations):
+        grad = _compute_rfdetr_gradient(model, x_adv, attack_name, attack_targets)
+        # The reference TOG implementation minimizes every attack objective.
+        # Keep the one-step helper's epsilon-sized update for FGSM.
+        step_size = eps if attack_name == "untargeted_fgsm" else eps_iter
+        x_adv = x_adv - step_size * grad.sign()
+        x_adv = torch.max(torch.min(x_adv, original + eps), original - eps).clamp(0.0, 1.0).detach()
     return x_adv.detach()
 
 
@@ -214,6 +323,7 @@ def _build_attack(
     eps: float,
     eps_iter: float,
     n_iter: int,
+    conf_threshold: float,
 ) -> Callable[[torch.Tensor, List[Dict[str, torch.Tensor]]], torch.Tensor]:
     supported = {
         "untargeted_fgsm",
@@ -232,6 +342,7 @@ def _build_attack(
         eps=eps,
         eps_iter=eps_iter,
         n_iter=n_iter,
+        conf_threshold=conf_threshold,
     )
 
 
@@ -264,7 +375,14 @@ def _evaluate_single_attack(
     attack_name: str,
     args: argparse.Namespace,
 ) -> None:
-    attack_fn = _build_attack(attack_name, rfdetr_model, args.eps, args.eps_iter, args.n_iter)
+    attack_fn = _build_attack(
+        attack_name,
+        rfdetr_model,
+        args.eps,
+        args.eps_iter,
+        args.n_iter,
+        args.det_threshold,
+    )
     decompose = DecompositionLayer(
         noise_percent=args.noise_percent,
         device=device,
@@ -282,6 +400,10 @@ def _evaluate_single_attack(
     meter_restored = DetectionMetricTracker(
         iou_threshold=args.iou_threshold, score_threshold=args.score_threshold
     )
+    vanishing_clean_bce: List[float] = []
+    vanishing_adv_bce: List[float] = []
+    vanishing_clean_confidence: List[float] = []
+    vanishing_adv_confidence: List[float] = []
 
     if args.max_batches > 0:
         total = min(len(dataloader), args.max_batches)
@@ -296,6 +418,14 @@ def _evaluate_single_attack(
         images = images.to(device)
         images_adv = attack_fn(images, targets)
         images_restored = decompose(images_adv.detach().clone()).to(device)
+
+        if attack_name == "vanishing":
+            clean_diagnostics = _vanishing_diagnostics(rfdetr_model, images)
+            adversarial_diagnostics = _vanishing_diagnostics(rfdetr_model, images_adv)
+            vanishing_clean_bce.append(clean_diagnostics["zero_target_bce"])
+            vanishing_adv_bce.append(adversarial_diagnostics["zero_target_bce"])
+            vanishing_clean_confidence.append(clean_diagnostics["mean_max_class_probability"])
+            vanishing_adv_confidence.append(adversarial_diagnostics["mean_max_class_probability"])
 
         predictions_clean = _predict_batch_rfdetr(
             rfdetr_model, images, threshold=args.det_threshold
@@ -314,15 +444,36 @@ def _evaluate_single_attack(
         f1_clean = meter_clean.compute()["f1"]
         f1_adv = meter_adv.compute()["f1"]
         f1_restored = meter_restored.compute()["f1"]
-        progress.set_postfix_str(
-            f"F1 clean={f1_clean:.4f} adv={f1_adv:.4f} restored={f1_restored:.4f}"
-        )
+        status = f"F1 clean={f1_clean:.4f} adv={f1_adv:.4f} restored={f1_restored:.4f}"
+        if attack_name == "vanishing":
+            status += (
+                f" BCE {clean_diagnostics['zero_target_bce']:.4f}"
+                f"->{adversarial_diagnostics['zero_target_bce']:.4f}"
+            )
+        progress.set_postfix_str(status)
 
     print(f"Attack: {attack_name}")
     print(f"RF-DETR clean metrics: {meter_clean.compute()}")
     print(f"RF-DETR adversarial metrics: {meter_adv.compute()}")
     print(f"RF-DETR restored metrics: {meter_restored.compute()}")
     print(f"Decomposition params: {decompose.get_metadata()}")
+    if attack_name == "vanishing" and vanishing_clean_bce:
+        mean_clean_bce = sum(vanishing_clean_bce) / len(vanishing_clean_bce)
+        mean_adv_bce = sum(vanishing_adv_bce) / len(vanishing_adv_bce)
+        mean_clean_confidence = sum(vanishing_clean_confidence) / len(vanishing_clean_confidence)
+        mean_adv_confidence = sum(vanishing_adv_confidence) / len(vanishing_adv_confidence)
+        batches_decreased = sum(
+            adv_bce < clean_bce for clean_bce, adv_bce in zip(vanishing_clean_bce, vanishing_adv_bce)
+        )
+        print(
+            "RF-DETR vanishing diagnostic "
+            f"(direct {_get_rfdetr_resolution(rfdetr_model)}px forward): "
+            f"zero-target BCE {mean_clean_bce:.6f}->{mean_adv_bce:.6f}; "
+            f"mean max class probability {mean_clean_confidence:.6f}->{mean_adv_confidence:.6f}; "
+            f"BCE decreased in {batches_decreased}/{len(vanishing_clean_bce)} batches."
+        )
+        if mean_adv_bce >= mean_clean_bce:
+            print("WARNING: the vanishing objective did not decrease on average; do not interpret the metrics as a successful vanishing attack.")
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -343,7 +494,11 @@ def evaluate(args: argparse.Namespace) -> None:
     if args.rfdetr_weights:
         rfdetr_kwargs["pretrain_weights"] = args.rfdetr_weights
     rfdetr_model = RFDETRLarge(**rfdetr_kwargs)
-    device = _get_rfdetr_device(rfdetr_model)
+    # RF-DETR places its module lazily for public inference methods.  This script
+    # calls the underlying module directly to compute attack gradients, so place
+    # those weights explicitly before creating CUDA input tensors.
+    requested_device = args.device if args.device is not None else _get_rfdetr_device(rfdetr_model)
+    device = _move_rfdetr_model_to_device(rfdetr_model, requested_device)
     if args.attack == "all":
         attack_names = [
             "untargeted_fgsm",
@@ -371,7 +526,7 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate RFDETRLarge on COCO under TOG-style attacks generated with RFDETRLarge."
     )
     parser.add_argument("--rfdetr-weights", type=str, default="")
-    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--coco-split", type=str, default="val2017")
     parser.add_argument("--coco-annotation", type=str, default="instances_val2017.json")
     parser.add_argument("--image-size", type=int, default=640)
