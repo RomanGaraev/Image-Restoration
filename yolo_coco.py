@@ -48,7 +48,10 @@ def run_batch(model: YOLO,
     loss_items = None
     grad = None
 
-    if true_labels is not None:
+    # Evaluation only needs decoded detections.  Build a training loss only
+    # when a caller explicitly requests gradients; this also avoids coupling
+    # metric evaluation to Ultralytics' version-specific BboxLoss API.
+    if true_labels is not None and auto_backward:
         batch_size, num_preds, _ = pred_bboxes.shape
         target_bboxes = torch.zeros_like(pred_bboxes)
         target_scores = torch.zeros((batch_size, num_preds, 1), device=device, dtype=pred_bboxes.dtype)
@@ -252,22 +255,68 @@ def compute_object_mislabeling_gradient(model: YOLO,
     return grad
 
 
-def tog_untargeted_fgsm(model: YOLO, x_query, targets, eps=8/255.):
-    _, data_grad, _, _, _ = run_batch(model, x_query, targets, auto_backward=True, loss_type="bbox")
-    x_adv = torch.clamp(x_query + eps * data_grad.sign(), 0.0, 1.0)
+def _tog_foreground_confidence(model: YOLO, images: torch.Tensor, topk: int = 100) -> torch.Tensor:
+    """Differentiable confidence objective compatible with recent Ultralytics YOLO heads."""
+    preds = model.model(images)
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    preds_perm = preds.permute(0, 2, 1).contiguous()
+    channels = preds_perm.shape[-1]
+    nc = getattr(model.model.model[-1], "nc", None)
+
+    # YOLOv8/11 output: 4 box coordinates + nc class confidences.  Older
+    # heads include an objectness channel between boxes and class scores.
+    if nc is not None and channels == 4 + int(nc):
+        class_scores, objectness = preds_perm[..., 4:], None
+    elif channels > 5:
+        class_scores, objectness = preds_perm[..., 5:], preds_perm[..., 4:5]
+    else:
+        class_scores, objectness = preds_perm[..., 4:], None
+
+    def probabilities(scores: torch.Tensor) -> torch.Tensor:
+        detached = scores.detach()
+        return scores if detached.amin() >= 0 and detached.amax() <= 1 else scores.sigmoid()
+
+    class_probs = probabilities(class_scores)
+    foreground = class_probs.amax(dim=-1)
+    if objectness is not None:
+        foreground = foreground * probabilities(objectness).squeeze(-1)
+    k = min(topk, foreground.shape[-1])
+    return foreground.topk(k=k, dim=-1).values.mean() if k else foreground.mean()
+
+
+def _tog_projected_suppression(model: YOLO, x_query: torch.Tensor, n_iter: int,
+                               eps: float, eps_iter: float, topk: int = 100) -> torch.Tensor:
+    """Minimize top detector confidence with a projected L-infinity update."""
+    original = x_query.detach()
+    eta = torch.empty_like(original).uniform_(-eps, eps)
+    x_adv = (original + eta).clamp(0.0, 1.0)
+    detector = model.model
+    was_training = detector.training
+    detector.eval()
+
+    for _ in range(n_iter):
+        x_adv = x_adv.detach().requires_grad_(True)
+        loss = _tog_foreground_confidence(model, x_adv, topk=topk)
+        detector.zero_grad(set_to_none=True)
+        grad = torch.autograd.grad(loss, x_adv, only_inputs=True)[0]
+        x_adv = x_adv - eps_iter * grad.sign()
+        x_adv = torch.max(torch.min(x_adv, original + eps), original - eps).clamp(0.0, 1.0)
+
+    if was_training:
+        detector.train()
+    detector.zero_grad(set_to_none=True)
     return x_adv.detach()
+
+
+def tog_untargeted_fgsm(model: YOLO, x_query, targets, eps=8/255.):
+    """One-step TOG-style object-suppression attack (targets kept for API compatibility)."""
+    return _tog_projected_suppression(model, x_query, n_iter=1, eps=eps, eps_iter=eps)
 
 
 def tog_untargeted_multistep_fgsm(model: YOLO, x_query, targets, n_iter=10, eps=8/255., eps_iter=8/255.):
-    eta = np.random.uniform(-eps, eps, size=x_query.shape).astype(np.float32)
-    eta = torch.tensor(eta).to(x_query.device)
-    x_adv = torch.clip(x_query + eta, 0.0, 1.0)
-    for iter in range(n_iter):      
-        _, data_grad, _, _, _ = run_batch(model, x_adv, targets, auto_backward=True)
-        x_adv = torch.clamp(x_query + eps_iter * data_grad.sign(), 0.0, 1.0)
-        eta = torch.clip(x_adv - x_query, -eps, eps)
-        x_adv = torch.clip(x_query + eta, 0.0, 1.0)
-    return x_adv.detach()
+    """Multi-step TOG-style object-suppression attack for modern Ultralytics YOLO."""
+    return _tog_projected_suppression(model, x_query, n_iter=n_iter, eps=eps, eps_iter=eps_iter)
 
 
 def tog_vanishing(model: YOLO, x_query, targets, n_iter=10, eps=8/255., eps_iter=8/255.):
